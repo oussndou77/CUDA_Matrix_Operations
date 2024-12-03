@@ -3,18 +3,30 @@
 #include <time.h>
 #include <cuda_runtime.h>
 
-// Fonctions CPU
+// Prototypes des fonctions CPU et GPU
 void MatrixInit(float *M, int n, int p);
 void MatrixPrint(float *M, int n, int p);
 void MatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
 void MatrixMult(float *M1, float *M2, float *Mout, int n);
 
-// Fonctions GPU
 __global__ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
 __global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n);
 
-int main() {
-    int n = 1000; // Taille de la matrice (n x n)
+int main(int argc, char *argv[]) {
+    // Vérifier les arguments
+    if (argc != 2) {
+        printf("Usage : %s <taille de la matrice (n x n)>\n", argv[0]);
+        return -1;
+    }
+
+    // Lire la taille de la matrice à partir des arguments
+    int n = atoi(argv[1]); // Convertir l'argument en entier
+    if (n <= 0) {
+        printf("Erreur : La taille de la matrice doit être un entier positif.\n");
+        return -1;
+    }
+
+    // Taille de la mémoire à allouer pour chaque matrice
     size_t size = n * n * sizeof(float);
 
     // Allocation mémoire sur CPU
@@ -26,20 +38,19 @@ int main() {
     MatrixInit(h_M1, n, n);
     MatrixInit(h_M2, n, n);
 
-    // Affichage des matrices
     printf("Matrice 1 (partielle) :\n");
-    MatrixPrint(h_M1, 4, 4); // Affiche une partie de la matrice
+    MatrixPrint(h_M1, 4, 4); // Affiche une portion de la matrice
     printf("Matrice 2 (partielle) :\n");
-    MatrixPrint(h_M2, 4, 4); // Affiche une partie de la matrice
+    MatrixPrint(h_M2, 4, 4);
 
-    // Mesurer le temps d'addition sur CPU
+    // Addition sur CPU
     clock_t start = clock();
     MatrixAdd(h_M1, h_M2, h_Mout, n, n);
     clock_t end = clock();
     double cpu_time_add = ((double)(end - start)) / CLOCKS_PER_SEC;
     printf("Temps d'execution de l'addition sur CPU : %f secondes\n", cpu_time_add);
 
-    // Mesurer la multiplication sur CPU
+    // Multiplication sur CPU
     start = clock();
     MatrixMult(h_M1, h_M2, h_Mout, n);
     end = clock();
@@ -56,11 +67,12 @@ int main() {
     cudaMemcpy(d_M1, h_M1, size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_M2, h_M2, size, cudaMemcpyHostToDevice);
 
-    // Configuration des dimensions de grid et block
+    // Configuration de grid et block
     dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((n + 15) / 16, (n + 15) / 16);
+    dim3 numBlocks((n + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-    // Mesurer le temps d'addition sur GPU
+    // Addition sur GPU
     cudaEvent_t start_gpu, stop_gpu;
     float elapsedTime;
     cudaEventCreate(&start_gpu);
@@ -72,7 +84,7 @@ int main() {
     cudaEventElapsedTime(&elapsedTime, start_gpu, stop_gpu);
     printf("Temps d'execution de l'addition sur GPU : %f ms\n", elapsedTime);
 
-    // Mesurer la multiplication sur GPU
+    // Multiplication sur GPU
     cudaEventRecord(start_gpu);
     cudaMatrixMult<<<numBlocks, threadsPerBlock>>>(d_M1, d_M2, d_Mout, n);
     cudaEventRecord(stop_gpu);
@@ -80,13 +92,7 @@ int main() {
     cudaEventElapsedTime(&elapsedTime, start_gpu, stop_gpu);
     printf("Temps d'execution de la multiplication sur GPU : %f ms\n", elapsedTime);
 
-    // Calcul de l'accélération réelle
-    double accel_add_real = cpu_time_add / (elapsedTime / 1000);  // Convertir GPU en secondes
-    double accel_mult_real = cpu_time_mult / (elapsedTime / 1000);
-    printf("Acceleration reelle pour l'addition : %f\n", accel_add_real);
-    printf("Acceleration reelle pour la multiplication : %f\n", accel_mult_real);
-
-    // Libération de la mémoire
+    // Libération mémoire
     free(h_M1);
     free(h_M2);
     free(h_Mout);
@@ -96,6 +102,7 @@ int main() {
 
     return 0;
 }
+
 
 // Fonction pour initialiser une matrice avec des valeurs aléatoires entre -1 et 1
 void MatrixInit(float *M, int n, int p) {
