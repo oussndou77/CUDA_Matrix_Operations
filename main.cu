@@ -8,9 +8,15 @@ void MatrixInit(float *M, int n, int p);
 void MatrixPrint(float *M, int n, int p);
 void MatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
 void MatrixMult(float *M1, float *M2, float *Mout, int n);
+void subsampling2D(float *input, float *output, int input_size, int output_size, int num_channels);
+void convolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels);
 
 __global__ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
 __global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n);
+
+// Initialisation des matrices spécifiques à LeNet-5
+void init_matrix(float *matrix, int size);
+void init_zero(float *matrix, int size);
 
 int main(int argc, char *argv[]) {
     // Vérifier les arguments
@@ -42,6 +48,57 @@ int main(int argc, char *argv[]) {
     MatrixPrint(h_M1, 4, 4); // Affiche une portion de la matrice
     printf("Matrice 2 (partielle) :\n");
     MatrixPrint(h_M2, 4, 4);
+
+    // Partie 2 - Matrices LeNet-5
+    printf("\nInitialisation des matrices pour LeNet-5\n");
+
+    // Dimensions
+    int raw_size = 32;          // Taille d'entrée
+    int kernel_size = 5;        // Taille du noyau
+    int C1_size = 28;           // Taille de sortie après convolution
+    int S1_size = 14;           // Taille de sortie après sous-échantillonnage
+    int num_kernels = 6;        // Nombre de noyaux
+
+    // Allocation mémoire
+    float *raw_data = (float *)malloc(raw_size * raw_size * sizeof(float));
+    float *C1_data = (float *)malloc(num_kernels * C1_size * C1_size * sizeof(float));
+    float *S1_data = (float *)malloc(num_kernels * S1_size * S1_size * sizeof(float));
+    float *C1_kernel = (float *)malloc(num_kernels * kernel_size * kernel_size * sizeof(float));
+
+
+    // Initialisation des matrices
+    init_matrix(raw_data, raw_size);   // raw_data entre 0 et 1
+    init_zero(C1_data, C1_size);       // C1_data initialisé à 0
+    init_zero(S1_data, S1_size);       // S1_data initialisé à 0
+    init_matrix(C1_kernel, kernel_size); // C1_kernel entre 0 et 1
+
+    // Afficher quelques valeurs de raw_data
+    printf("raw_data (4 premiers elements) : ");
+    for (int i = 0; i < 4; i++) printf("%.2f ", raw_data[i]);
+    printf("\n");
+
+    // Convolution 2D
+    convolution2D(raw_data, C1_data, C1_kernel, raw_size, kernel_size, C1_size, num_kernels);
+
+    // Afficher quelques valeurs de C1_data
+    printf("C1_data (4 premiers elements) : ");
+    for (int i = 0; i < 4; i++) printf("%.2f ", C1_data[i]);
+    printf("\n");
+
+    // Sous-échantillonnage 2D
+    subsampling2D(C1_data, S1_data, C1_size, S1_size, num_kernels);
+
+    // Afficher quelques valeurs de S1_data
+    printf("S1_data (4 premiers elements) : ");
+    for (int i = 0; i < 4; i++) printf("%.2f ", S1_data[i]);
+    printf("\n");
+
+    // Libération mémoire pour LeNet-5
+    free(raw_data);
+    free(C1_data);
+    free(S1_data);
+    free(C1_kernel);
+
 
     // Addition sur CPU
     clock_t start = clock();
@@ -92,6 +149,13 @@ int main(int argc, char *argv[]) {
     cudaEventElapsedTime(&elapsedTime, start_gpu, stop_gpu);
     printf("Temps d'execution de la multiplication sur GPU : %f ms\n", elapsedTime);
 
+     // Calcul de l'accélération réelle
+    double accel_add_real = cpu_time_add / (elapsedTime / 1000);  // Convertir GPU en secondes
+    double accel_mult_real = cpu_time_mult / (elapsedTime / 1000);
+    printf("Acceleration reelle pour l'addition : %f\n", accel_add_real);
+    printf("Acceleration reelle pour la multiplication : %f\n", accel_mult_real);
+
+
     // Libération mémoire
     free(h_M1);
     free(h_M2);
@@ -103,6 +167,19 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
+// Fonction d'initialisation pour les matrices entre 0 et 1
+void init_matrix(float *matrix, int size) {
+    for (int i = 0; i < size; i++) {
+        matrix[i] = (float)rand() / (float)RAND_MAX; // Valeurs entre 0 et 1
+    }
+}
+
+// Fonction d'initialisation à 0
+void init_zero(float *matrix, int size) {
+    for (int i = 0; i < size; i++) {
+        matrix[i] = 0.0f;
+    }
+}
 
 // Fonction pour initialiser une matrice avec des valeurs aléatoires entre -1 et 1
 void MatrixInit(float *M, int n, int p) {
@@ -162,5 +239,44 @@ __global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n) {
             sum += M1[row * n + k] * M2[k * n + col];
         }
         Mout[row * n + col] = sum;
+    }
+}
+
+// Fonction pour effectuer la convolution 2D
+void convolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels) {
+    for (int k = 0; k < num_kernels; k++) { // Pour chaque noyau
+        for (int i = 0; i < output_size; i++) {
+            for (int j = 0; j < output_size; j++) {
+                float sum = 0.0f;
+                for (int ki = 0; ki < kernel_size; ki++) {
+                    for (int kj = 0; kj < kernel_size; kj++) {
+                        int input_row = i + ki;
+                        int input_col = j + kj;
+                        sum += input[input_row * input_size + input_col] *
+                               kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
+                    }
+                }
+                output[k * output_size * output_size + i * output_size + j] = sum;
+            }
+        }
+    }
+}
+
+// Fonction pour effectuer le sous-échantillonnage 2D (moyennage)
+void subsampling2D(float *input, float *output, int input_size, int output_size, int num_channels) {
+    for (int c = 0; c < num_channels; c++) { // Pour chaque canal
+        for (int i = 0; i < output_size; i++) {
+            for (int j = 0; j < output_size; j++) {
+                int input_row = i * 2;
+                int input_col = j * 2;
+                float sum = 0.0f;
+                for (int ki = 0; ki < 2; ki++) {
+                    for (int kj = 0; kj < 2; kj++) {
+                        sum += input[c * input_size * input_size + (input_row + ki) * input_size + (input_col + kj)];
+                    }
+                }
+                output[c * output_size * output_size + i * output_size + j] = sum / 4.0f;
+            }
+        }
     }
 }
