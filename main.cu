@@ -13,6 +13,11 @@ void convolution2D(float *input, float *output, float *kernels, int input_size, 
 
 __global__ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
 __global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n);
+// Kernel pour effectuer la convolution 2D avec activation tanh
+__global__ void cudaConvolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels);
+
+
+__device__ float activation_tanh(float M);
 
 // Initialisation des matrices spécifiques à LeNet-5
 void init_matrix(float *matrix, int size);
@@ -62,13 +67,38 @@ int main(int argc, char *argv[]) {
     // Allocation mémoire
     float *raw_data = (float *)malloc(raw_size * raw_size * sizeof(float));
     float *C1_data = (float *)malloc(num_kernels * C1_size * C1_size * sizeof(float));
+    float *C1_data_woaf = (float *)malloc(num_kernels * C1_size * C1_size * sizeof(float));
     float *S1_data = (float *)malloc(num_kernels * S1_size * S1_size * sizeof(float));
     float *C1_kernel = (float *)malloc(num_kernels * kernel_size * kernel_size * sizeof(float));
+
+    // Allocation sur GPU
+    float *d_input, *d_output, *d_kernels;
+    cudaMalloc((void **)&d_input, raw_size * raw_size * sizeof(float));
+    cudaMalloc((void **)&d_output, num_kernels * C1_size * C1_size * sizeof(float));
+    cudaMalloc((void **)&d_kernels, num_kernels * kernel_size * kernel_size * sizeof(float));
+
+    // Copier les données vers le GPU
+    cudaMemcpy(d_input, raw_data, raw_size * raw_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernels, C1_kernel, num_kernels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Configuration des blocs et grilles
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((C1_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (C1_size + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   num_kernels);
+
+    // Lancer le kernel de convolution avec activation tanh
+    cudaConvolution2D<<<numBlocks, threadsPerBlock>>>(d_input, d_output, d_kernels, raw_size, kernel_size, C1_size, num_kernels);
+
+    // Copier les résultats du GPU vers le CPU
+    cudaMemcpy(C1_data, d_output, num_kernels * C1_size * C1_size * sizeof(float), cudaMemcpyDeviceToHost);
+
 
 
     // Initialisation des matrices
     init_matrix(raw_data, raw_size);   // raw_data entre 0 et 1
-    init_zero(C1_data, C1_size);       // C1_data initialisé à 0
+    init_zero(C1_data_woaf, C1_size);  // C1_datawoaf initialisé à 0
+    init_zero(C1_data, C1_size);    // C1_data initialisé à 0
     init_zero(S1_data, S1_size);       // S1_data initialisé à 0
     init_matrix(C1_kernel, kernel_size); // C1_kernel entre 0 et 1
 
@@ -78,11 +108,19 @@ int main(int argc, char *argv[]) {
     printf("\n");
 
     // Convolution 2D
-    convolution2D(raw_data, C1_data, C1_kernel, raw_size, kernel_size, C1_size, num_kernels);
+    convolution2D(raw_data, C1_data_woaf, C1_kernel, raw_size, kernel_size, C1_size, num_kernels);
 
-    // Afficher quelques valeurs de C1_data
-    printf("C1_data (4 premiers elements) : ");
-    for (int i = 0; i < 4; i++) printf("%.2f ", C1_data[i]);
+
+    // Afficher quelques valeurs de C1_data sans fonction d'activation
+    printf("C1_data_woaf sans fonction d'activation tanh (4 premiers elements) : ");
+    for (int i = 0; i < 4; i++) printf("%.2f ", C1_data_woaf[i]);
+    printf("\n");
+    
+    // Afficher quelques valeurs de C1_data avec la fonction d'activation tanh
+    printf("C1_data avec la fonction d'activation tanh (4 premiers elements) : ");
+    for (int i = 0; i < 4; i++) {
+        printf("%.2f ", C1_data[i]);
+    }
     printf("\n");
 
     // Sous-échantillonnage 2D
@@ -124,10 +162,7 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_M1, h_M1, size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_M2, h_M2, size, cudaMemcpyHostToDevice);
 
-    // Configuration de grid et block
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((n + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    
 
     // Addition sur GPU
     cudaEvent_t start_gpu, stop_gpu;
@@ -278,5 +313,70 @@ void subsampling2D(float *input, float *output, int input_size, int output_size,
                 output[c * output_size * output_size + i * output_size + j] = sum / 4.0f;
             }
         }
+    }
+}
+
+// Fonction d'activation tanh
+__device__ float activation_tanh(float M) {
+    return tanhf(M); // Fonction hyperbolique tangente optimisée
+}
+
+// Kernel pour effectuer la convolution 2D avec activation tanh
+__global__ void cudaConvolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels) {
+    int k = blockIdx.z; // Identifiant du noyau (canal)
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // Ligne de la matrice de sortie
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // Colonne de la matrice de sortie
+
+    if (k < num_kernels && i < output_size && j < output_size) {
+        float sum = 0.0f;
+        for (int ki = 0; ki < kernel_size; ki++) {
+            for (int kj = 0; kj < kernel_size; kj++) {
+                int input_row = i + ki;
+                int input_col = j + kj;
+                sum += input[input_row * input_size + input_col] *
+                       kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
+            }
+        }
+        // Appliquer l'activation tanh sur la somme calculée
+        output[k * output_size * output_size + i * output_size + j] = activation_tanh(sum);
+    }
+}
+
+// Pour la fonction d'activation softmax :
+// 4. Softmax Kernel
+__global__ void softmax(float* input, float* output, int size) {
+    extern __shared__ float temp[];
+    int idx = threadIdx.x;
+    if (idx < size) {
+        temp[idx] = expf(input[idx]);
+        __syncthreads();
+        float sum = 0.0f;
+        for (int i = 0; i < size; i++) sum += temp[i];
+        output[idx] = temp[idx] / sum;
+    }
+}
+// Pour le   keras.layers.Dense(120, activation='tanh'), #C5
+// 5. Fully Connected Layer Kernel for Dense 120
+__global__ void fullyConnected120(float* input, float* weights, float* biases, float* output, int input_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < 120) {
+        float sum = biases[idx];
+        for (int i = 0; i < input_size; i++) {
+            sum += input[i] * weights[idx * input_size + i];
+        }
+        output[idx] = tanhf(sum);
+    }
+}
+
+// Pour le   keras.layers.Dense(84, activation='tanh'), #C5
+// 6. Fully Connected Layer Kernel for Dense 84
+__global__ void fullyConnected84(float* input, float* weights, float* biases, float* output, int input_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < 84) {
+        float sum = biases[idx];
+        for (int i = 0; i < input_size; i++) {
+            sum += input[i] * weights[idx * input_size + i];
+        }
+        output[idx] = tanhf(sum);
     }
 }
