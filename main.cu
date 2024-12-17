@@ -333,14 +333,14 @@ __global__ void cudaConvolution2D(float *input, float *output, float *kernels, i
             for (int kj = 0; kj < kernel_size; kj++) {
                 int input_row = i + ki;
                 int input_col = j + kj;
-                sum += input[input_row * input_size + input_col] *
-                       kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
+                sum += input[input_row * input_size + input_col] * kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
             }
         }
         // Appliquer l'activation tanh sur la somme calculée
         output[k * output_size * output_size + i * output_size + j] = activation_tanh(sum);
     }
 }
+
 
 // Pour la fonction d'activation softmax :
 // 4. Softmax Kernel
@@ -380,3 +380,15 @@ __global__ void fullyConnected84(float* input, float* weights, float* biases, fl
         output[idx] = tanhf(sum);
     }
 }
+
+// Importation des poids dans les matrices CUDA
+void loadWeights(const char *file_path, float *host_data, int size) {
+    FILE *file = fopen(file_path, "rb");
+    if (file == NULL) {
+        printf("Erreur : impossible d'ouvrir le fichier %s\n", file_path);
+        exit(1);
+    }
+    fread(host_data, sizeof(float), size, file);
+    fclose(file);
+}
+
