@@ -93,3 +93,7 @@ Pour tester une image particulière, ajoutez l'indice de l'image :
 # 💬 Remerciements
 
 Ce projet a été réalisé avec mon binôme de TP, Mathys BARRIE, dont les idées et la collaboration ont été essentielles à la réussite de ce travail. 🙌
+
+# 📁 Plus de détails
+
+Si vous souhaitez en savoir plus sur nos résultats, n'hésitez pas à consulter le dossier **Compte-Rendu** 📚, où vous trouverez un résumé détaillé de notre travail. 🔍
