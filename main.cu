@@ -1,394 +1,639 @@
+/****************************************************/
+/*                 main.cu complet                 */
+/*       Lecture MNIST + Affichage console +        */
+/*         Inférence LeNet-5 + Prédiction           */
+/****************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
-// Prototypes des fonctions CPU et GPU
-void MatrixInit(float *M, int n, int p);
-void MatrixPrint(float *M, int n, int p);
-void MatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
-void MatrixMult(float *M1, float *M2, float *Mout, int n);
-void subsampling2D(float *input, float *output, int input_size, int output_size, int num_channels);
-void convolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels);
+//==================================================//
+//  Constantes / dimensions pour MNIST et LeNet-5   //
+//==================================================//
+static const int MNIST_ROWS   = 28;
+static const int MNIST_COLS   = 28;
+static const int RAW_SIZE     = 32; // padding 2 sur chaque bord (28 → 32)
+static const int KERNEL_SIZE  = 5;
 
-__global__ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p);
-__global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n);
-// Kernel pour effectuer la convolution 2D avec activation tanh
-__global__ void cudaConvolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels);
+static const int C1_OUT_CH   = 6;
+static const int C1_OUT_SIZE = 28;  // 32 - 5 + 1
 
+static const int S1_OUT_SIZE = 14;  // pooling 2x2
 
-__device__ float activation_tanh(float M);
+static const int C3_OUT_CH   = 16;
+static const int C3_OUT_SIZE = 10;  // 14 - 5 + 1
 
-// Initialisation des matrices spécifiques à LeNet-5
-void init_matrix(float *matrix, int size);
-void init_zero(float *matrix, int size);
+static const int S4_OUT_SIZE = 5;   // pooling 2x2 -> 5
 
+// fully-connected
+static const int FC1_SIZE = 120;  // layer 5
+static const int FC2_SIZE = 84;   // layer 6
+static const int FC3_SIZE = 10;   // layer 7 (sortie)
+
+//==================================================//
+//   Prototypes pour lecture/affichage MNIST        //
+//==================================================//
+unsigned int swapEndian(unsigned int value);
+float* readMNISTImage(const char* filename, int imgIndex);
+
+// Pour l'affichage en console
+void charBckgrndPrint(char *str, int rgb[3]);
+void imgColorPrint(int height, int width, int ***img);
+int ***allocImgRGB(int height, int width);
+void freeImgRGB(int ***img, int height, int width);
+
+//==================================================//
+//   Prototypes pour chargement de poids / biais    //
+//==================================================//
+void loadWeights(const char *file_path, float *host_data, int size);
+
+//==================================================//
+//   Prototypes pour la convolution multi-canal     //
+//==================================================//
+__global__ void cudaConv2DMultiChannel(
+    float *input,    // [in_channels, input_size, input_size]
+    float *output,   // [out_channels, output_size, output_size]
+    float *kernels,  // [out_channels, in_channels, 5,5]
+    float *bias,     // [out_channels]
+    int in_channels,
+    int input_size,
+    int kernel_size,
+    int out_channels,
+    int output_size
+);
+
+// Pooling (CPU)
+void subsampling2D(float* input, float* output, 
+                   int input_size, int output_size,
+                   int num_channels);
+
+// Flatten (CPU)
+void flattenCPU(float* input, float* output, 
+                int channels, int height, int width);
+
+//==================================================//
+//   Fully-Connected (GPU) + Softmax                //
+//==================================================//
+__global__ void fullyConnected120(float* input, float* weights, float* biases,
+                                  float* output, int input_size);
+__global__ void fullyConnected84(float* input, float* weights, float* biases,
+                                 float* output, int input_size);
+__global__ void fullyConnected10(float* input, float* weights, float* biases,
+                                 float* output, int input_size);
+
+__global__ void softmaxKernel(float* input, float* output, int size);
+
+// argmax CPU
+int argmaxCPU(float* data, int size);
+
+//==================================================//
+//                   main()                         //
+//==================================================//
 int main(int argc, char *argv[]) {
-    // Vérifier les arguments
-    if (argc != 2) {
-        printf("Usage : %s <taille de la matrice (n x n)>\n", argv[0]);
-        return -1;
+    if (argc != 3) {
+        printf("Usage : %s <fichier_mnist_images> <index_image>\n", argv[0]);
+        return 1;
+    }
+    const char* mnistFile = argv[1];
+    int imgIndex = atoi(argv[2]);
+
+    /*****************************************************/
+    /*     1) Lire l'image MNIST (28x28) et l'afficher   */
+    /*****************************************************/
+    float* mnistImage = readMNISTImage(mnistFile, imgIndex);
+
+    // On crée un tableau [28][28][3] pour l'affichage "couleur"
+    int ***imgRGB = allocImgRGB(MNIST_ROWS, MNIST_COLS);
+
+    // Remplir en nuances de gris inversées
+    //  - plus la valeur est élevée, plus on met une teinte foncée
+    for(int i=0; i<MNIST_ROWS; i++){
+        for(int j=0; j<MNIST_COLS; j++){
+            float val = mnistImage[i*MNIST_COLS + j]; // [0..1]
+            int intensity = (int)(255 - (val * 255)); // inversé
+            imgRGB[i][j][0] = intensity;
+            imgRGB[i][j][1] = intensity;
+            imgRGB[i][j][2] = intensity;
+        }
     }
 
-    // Lire la taille de la matrice à partir des arguments
-    int n = atoi(argv[1]); // Convertir l'argument en entier
-    if (n <= 0) {
-        printf("Erreur : La taille de la matrice doit être un entier positif.\n");
-        return -1;
+    // Afficher dans la console
+    printf("=== IMAGE MNIST index %d ===\n", imgIndex);
+    imgColorPrint(MNIST_ROWS, MNIST_COLS, imgRGB);
+    // on peut libérer la structure d'affichage
+    freeImgRGB(imgRGB, MNIST_ROWS, MNIST_COLS);
+
+    // A ce stade, on sait exactement à quoi ressemble l'image traitée
+    // On passe maintenant à l'inférence LeNet-5
+
+    /*****************************************************/
+    /* 2) Préparer l'input 32x32 (padding) + GPU        */
+    /*****************************************************/
+    float* d_inputImage;
+    cudaMallocManaged(&d_inputImage, RAW_SIZE * RAW_SIZE * sizeof(float));
+    // Mettre tout à 0
+    for(int i=0; i<RAW_SIZE*RAW_SIZE; i++){
+        d_inputImage[i] = 0.0f;
+    }
+    // Copier l'image 28x28 au centre (offset=2)
+    for(int r=0; r<28; r++){
+        for(int c=0; c<28; c++){
+            d_inputImage[(r+2)*RAW_SIZE + (c+2)] = mnistImage[r*28 + c];
+        }
+    }
+    free(mnistImage);
+
+    /*****************************************************/
+    /* 3) Charger les poids et biais depuis *.bin        */
+    /*****************************************************/
+    // C1
+    float *d_C1_kernels, *d_C1_bias;
+    cudaMallocManaged(&d_C1_kernels, C1_OUT_CH * 1 * KERNEL_SIZE*KERNEL_SIZE * sizeof(float));
+    cudaMallocManaged(&d_C1_bias,    C1_OUT_CH * sizeof(float));
+    loadWeights("weights_layer_0.bin", d_C1_kernels, C1_OUT_CH * 1 * KERNEL_SIZE*KERNEL_SIZE);
+    loadWeights("biases_layer_0.bin",  d_C1_bias,    C1_OUT_CH);
+
+    // C3
+    float *d_C3_kernels, *d_C3_bias;
+    cudaMallocManaged(&d_C3_kernels, C3_OUT_CH * C1_OUT_CH * KERNEL_SIZE*KERNEL_SIZE * sizeof(float));
+    cudaMallocManaged(&d_C3_bias,    C3_OUT_CH * sizeof(float));
+    loadWeights("weights_layer_2.bin", d_C3_kernels, C3_OUT_CH*C1_OUT_CH*KERNEL_SIZE*KERNEL_SIZE);
+    loadWeights("biases_layer_2.bin",  d_C3_bias,    C3_OUT_CH);
+
+    // FC1
+    float *d_FC1_weights, *d_FC1_bias;
+    cudaMallocManaged(&d_FC1_weights, FC1_SIZE * 400 * sizeof(float));
+    cudaMallocManaged(&d_FC1_bias,    FC1_SIZE * sizeof(float));
+    loadWeights("weights_layer_5.bin", d_FC1_weights, FC1_SIZE*400);
+    loadWeights("biases_layer_5.bin",  d_FC1_bias,    FC1_SIZE);
+
+    // FC2
+    float *d_FC2_weights, *d_FC2_bias;
+    cudaMallocManaged(&d_FC2_weights, FC2_SIZE * FC1_SIZE * sizeof(float));
+    cudaMallocManaged(&d_FC2_bias,    FC2_SIZE * sizeof(float));
+    loadWeights("weights_layer_6.bin", d_FC2_weights, FC2_SIZE*FC1_SIZE);
+    loadWeights("biases_layer_6.bin",  d_FC2_bias,    FC2_SIZE);
+
+    // FC3
+    float *d_FC3_weights, *d_FC3_bias;
+    cudaMallocManaged(&d_FC3_weights, FC3_SIZE * FC2_SIZE * sizeof(float));
+    cudaMallocManaged(&d_FC3_bias,    FC3_SIZE * sizeof(float));
+    loadWeights("weights_layer_7.bin", d_FC3_weights, FC3_SIZE*FC2_SIZE);
+    loadWeights("biases_layer_7.bin",  d_FC3_bias,    FC3_SIZE);
+
+    /*****************************************************/
+    /* 4) C1: convolution (1->6)                         */
+    /*****************************************************/
+    float* d_C1_output;
+    cudaMallocManaged(&d_C1_output, C1_OUT_CH * C1_OUT_SIZE * C1_OUT_SIZE * sizeof(float));
+    {
+        dim3 threads(16,16,1);
+        dim3 blocks(
+            (C1_OUT_SIZE+threads.x-1)/threads.x,
+            (C1_OUT_SIZE+threads.y-1)/threads.y,
+            C1_OUT_CH
+        );
+        cudaConv2DMultiChannel<<<blocks, threads>>>(
+            d_inputImage,
+            d_C1_output,
+            d_C1_kernels,
+            d_C1_bias,
+            1,           // in_channels
+            RAW_SIZE,    // in_size
+            KERNEL_SIZE,
+            C1_OUT_CH,
+            C1_OUT_SIZE
+        );
+        cudaDeviceSynchronize();
     }
 
-    // Taille de la mémoire à allouer pour chaque matrice
-    size_t size = n * n * sizeof(float);
+    /*****************************************************/
+    /* 5) S2: pooling (6@28x28 -> 6@14x14) (CPU)         */
+    /*****************************************************/
+    float* h_S2_output = (float*)malloc(C1_OUT_CH * S1_OUT_SIZE * S1_OUT_SIZE * sizeof(float));
+    subsampling2D(d_C1_output, h_S2_output, C1_OUT_SIZE, S1_OUT_SIZE, C1_OUT_CH);
 
-    // Allocation mémoire sur CPU
-    float *h_M1 = (float *)malloc(size);
-    float *h_M2 = (float *)malloc(size);
-    float *h_Mout = (float *)malloc(size);
+    /*****************************************************/
+    /* 6) C3: convolution (6->16) => 16@10x10            */
+    /*****************************************************/
+    float* d_C3_output;
+    cudaMallocManaged(&d_C3_output, C3_OUT_CH * C3_OUT_SIZE * C3_OUT_SIZE * sizeof(float));
+    {
+        // Il faut copier S2 (CPU) -> GPU
+        float* d_S2;
+        cudaMallocManaged(&d_S2, C1_OUT_CH * S1_OUT_SIZE * S1_OUT_SIZE * sizeof(float));
+        for(int i=0; i<C1_OUT_CH*S1_OUT_SIZE*S1_OUT_SIZE; i++){
+            d_S2[i] = h_S2_output[i];
+        }
 
-    // Initialisation des matrices
-    MatrixInit(h_M1, n, n);
-    MatrixInit(h_M2, n, n);
-
-    printf("Matrice 1 (partielle) :\n");
-    MatrixPrint(h_M1, 4, 4); // Affiche une portion de la matrice
-    printf("Matrice 2 (partielle) :\n");
-    MatrixPrint(h_M2, 4, 4);
-
-    // Partie 2 - Matrices LeNet-5
-    printf("\nInitialisation des matrices pour LeNet-5\n");
-
-    // Dimensions
-    int raw_size = 32;          // Taille d'entrée
-    int kernel_size = 5;        // Taille du noyau
-    int C1_size = 28;           // Taille de sortie après convolution
-    int S1_size = 14;           // Taille de sortie après sous-échantillonnage
-    int num_kernels = 6;        // Nombre de noyaux
-
-    // Allocation mémoire
-    float *raw_data = (float *)malloc(raw_size * raw_size * sizeof(float));
-    float *C1_data = (float *)malloc(num_kernels * C1_size * C1_size * sizeof(float));
-    float *C1_data_woaf = (float *)malloc(num_kernels * C1_size * C1_size * sizeof(float));
-    float *S1_data = (float *)malloc(num_kernels * S1_size * S1_size * sizeof(float));
-    float *C1_kernel = (float *)malloc(num_kernels * kernel_size * kernel_size * sizeof(float));
-
-    // Allocation sur GPU
-    float *d_input, *d_output, *d_kernels;
-    cudaMalloc((void **)&d_input, raw_size * raw_size * sizeof(float));
-    cudaMalloc((void **)&d_output, num_kernels * C1_size * C1_size * sizeof(float));
-    cudaMalloc((void **)&d_kernels, num_kernels * kernel_size * kernel_size * sizeof(float));
-
-    // Copier les données vers le GPU
-    cudaMemcpy(d_input, raw_data, raw_size * raw_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kernels, C1_kernel, num_kernels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Configuration des blocs et grilles
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((C1_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (C1_size + threadsPerBlock.y - 1) / threadsPerBlock.y,
-                   num_kernels);
-
-    // Lancer le kernel de convolution avec activation tanh
-    cudaConvolution2D<<<numBlocks, threadsPerBlock>>>(d_input, d_output, d_kernels, raw_size, kernel_size, C1_size, num_kernels);
-
-    // Copier les résultats du GPU vers le CPU
-    cudaMemcpy(C1_data, d_output, num_kernels * C1_size * C1_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-
-
-    // Initialisation des matrices
-    init_matrix(raw_data, raw_size);   // raw_data entre 0 et 1
-    init_zero(C1_data_woaf, C1_size);  // C1_datawoaf initialisé à 0
-    init_zero(C1_data, C1_size);    // C1_data initialisé à 0
-    init_zero(S1_data, S1_size);       // S1_data initialisé à 0
-    init_matrix(C1_kernel, kernel_size); // C1_kernel entre 0 et 1
-
-    // Afficher quelques valeurs de raw_data
-    printf("raw_data (4 premiers elements) : ");
-    for (int i = 0; i < 4; i++) printf("%.2f ", raw_data[i]);
-    printf("\n");
-
-    // Convolution 2D
-    convolution2D(raw_data, C1_data_woaf, C1_kernel, raw_size, kernel_size, C1_size, num_kernels);
-
-
-    // Afficher quelques valeurs de C1_data sans fonction d'activation
-    printf("C1_data_woaf sans fonction d'activation tanh (4 premiers elements) : ");
-    for (int i = 0; i < 4; i++) printf("%.2f ", C1_data_woaf[i]);
-    printf("\n");
-    
-    // Afficher quelques valeurs de C1_data avec la fonction d'activation tanh
-    printf("C1_data avec la fonction d'activation tanh (4 premiers elements) : ");
-    for (int i = 0; i < 4; i++) {
-        printf("%.2f ", C1_data[i]);
+        dim3 threads(16,16,1);
+        dim3 blocks(
+            (C3_OUT_SIZE+threads.x-1)/threads.x,
+            (C3_OUT_SIZE+threads.y-1)/threads.y,
+            C3_OUT_CH
+        );
+        cudaConv2DMultiChannel<<<blocks, threads>>>(
+            d_S2,
+            d_C3_output,
+            d_C3_kernels,
+            d_C3_bias,
+            C1_OUT_CH,
+            S1_OUT_SIZE,
+            KERNEL_SIZE,
+            C3_OUT_CH,
+            C3_OUT_SIZE
+        );
+        cudaDeviceSynchronize();
+        cudaFree(d_S2);
     }
-    printf("\n");
 
-    // Sous-échantillonnage 2D
-    subsampling2D(C1_data, S1_data, C1_size, S1_size, num_kernels);
+    /*****************************************************/
+    /* 7) S4: pooling (16@10x10 -> 16@5x5) (CPU)         */
+    /*****************************************************/
+    float* h_S4_output = (float*)malloc(C3_OUT_CH * S4_OUT_SIZE * S4_OUT_SIZE * sizeof(float));
+    subsampling2D(d_C3_output, h_S4_output, C3_OUT_SIZE, S4_OUT_SIZE, C3_OUT_CH);
 
-    // Afficher quelques valeurs de S1_data
-    printf("S1_data (4 premiers elements) : ");
-    for (int i = 0; i < 4; i++) printf("%.2f ", S1_data[i]);
-    printf("\n");
+    /*****************************************************/
+    /* 8) Flatten (16@5x5 -> 400) (CPU->GPU)            */
+    /*****************************************************/
+    float* h_flatten = (float*)malloc(400*sizeof(float));
+    flattenCPU(h_S4_output, h_flatten, C3_OUT_CH, S4_OUT_SIZE, S4_OUT_SIZE);
 
-    // Libération mémoire pour LeNet-5
-    free(raw_data);
-    free(C1_data);
-    free(S1_data);
-    free(C1_kernel);
+    float* d_flatten;
+    cudaMallocManaged(&d_flatten, 400*sizeof(float));
+    for(int i=0; i<400; i++){
+        d_flatten[i] = h_flatten[i];
+    }
 
+    /*****************************************************/
+    /* 9) FC1: 400 -> 120 + tanh (GPU)                  */
+    /*****************************************************/
+    float* d_FC1_output;
+    cudaMallocManaged(&d_FC1_output, FC1_SIZE*sizeof(float));
+    {
+        int blockSize = 128;
+        int gridSize  = (FC1_SIZE + blockSize - 1)/blockSize;
+        fullyConnected120<<<gridSize, blockSize>>>(
+            d_flatten, d_FC1_weights, d_FC1_bias,
+            d_FC1_output, 400
+        );
+        cudaDeviceSynchronize();
+    }
 
-    // Addition sur CPU
-    clock_t start = clock();
-    MatrixAdd(h_M1, h_M2, h_Mout, n, n);
-    clock_t end = clock();
-    double cpu_time_add = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf("Temps d'execution de l'addition sur CPU : %f secondes\n", cpu_time_add);
+    /*****************************************************/
+    /* 10) FC2: 120 -> 84 + tanh (GPU)                  */
+    /*****************************************************/
+    float* d_FC2_output;
+    cudaMallocManaged(&d_FC2_output, FC2_SIZE*sizeof(float));
+    {
+        int blockSize = 128;
+        int gridSize  = (FC2_SIZE + blockSize - 1)/blockSize;
+        fullyConnected84<<<gridSize, blockSize>>>(
+            d_FC1_output, d_FC2_weights, d_FC2_bias,
+            d_FC2_output, FC1_SIZE
+        );
+        cudaDeviceSynchronize();
+    }
 
-    // Multiplication sur CPU
-    start = clock();
-    MatrixMult(h_M1, h_M2, h_Mout, n);
-    end = clock();
-    double cpu_time_mult = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf("Temps d'execution de la multiplication sur CPU : %f secondes\n", cpu_time_mult);
+    /*****************************************************/
+    /* 11) FC3: 84 -> 10  => softmax (GPU)              */
+    /*****************************************************/
+    float* d_FC3_output;
+    cudaMallocManaged(&d_FC3_output, FC3_SIZE*sizeof(float));
+    {
+        int blockSize = 128;
+        int gridSize  = (FC3_SIZE + blockSize - 1)/blockSize;
+        fullyConnected10<<<gridSize, blockSize>>>(
+            d_FC2_output, d_FC3_weights, d_FC3_bias,
+            d_FC3_output, FC2_SIZE
+        );
+        cudaDeviceSynchronize();
+    }
 
-    // Allocation mémoire sur GPU
-    float *d_M1, *d_M2, *d_Mout;
-    cudaMalloc((void **)&d_M1, size);
-    cudaMalloc((void **)&d_M2, size);
-    cudaMalloc((void **)&d_Mout, size);
+    float* d_softmax;
+    cudaMallocManaged(&d_softmax, FC3_SIZE*sizeof(float));
+    {
+        int blockSize = 32; // 10 < 32
+        int gridSize  = 1;
+        softmaxKernel<<<gridSize, blockSize>>>(d_FC3_output, d_softmax, FC3_SIZE);
+        cudaDeviceSynchronize();
+    }
 
-    // Transfert des données CPU -> GPU
-    cudaMemcpy(d_M1, h_M1, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_M2, h_M2, size, cudaMemcpyHostToDevice);
+    /*****************************************************/
+    /* 12) Argmax => prédiction                          */
+    /*****************************************************/
+    int predicted = argmaxCPU(d_softmax, FC3_SIZE);
+    printf("\n=== PREDICTION = %d ===\n\n", predicted);
 
-    
+    /*****************************************************/
+    /* 13) Libérations mémoire                           */
+    /*****************************************************/
+    // CPU
+    free(h_S2_output);
+    free(h_S4_output);
+    free(h_flatten);
 
-    // Addition sur GPU
-    cudaEvent_t start_gpu, stop_gpu;
-    float elapsedTime;
-    cudaEventCreate(&start_gpu);
-    cudaEventCreate(&stop_gpu);
-    cudaEventRecord(start_gpu);
-    cudaMatrixAdd<<<numBlocks, threadsPerBlock>>>(d_M1, d_M2, d_Mout, n, n);
-    cudaEventRecord(stop_gpu);
-    cudaEventSynchronize(stop_gpu);
-    cudaEventElapsedTime(&elapsedTime, start_gpu, stop_gpu);
-    printf("Temps d'execution de l'addition sur GPU : %f ms\n", elapsedTime);
-
-    // Multiplication sur GPU
-    cudaEventRecord(start_gpu);
-    cudaMatrixMult<<<numBlocks, threadsPerBlock>>>(d_M1, d_M2, d_Mout, n);
-    cudaEventRecord(stop_gpu);
-    cudaEventSynchronize(stop_gpu);
-    cudaEventElapsedTime(&elapsedTime, start_gpu, stop_gpu);
-    printf("Temps d'execution de la multiplication sur GPU : %f ms\n", elapsedTime);
-
-     // Calcul de l'accélération réelle
-    double accel_add_real = cpu_time_add / (elapsedTime / 1000);  // Convertir GPU en secondes
-    double accel_mult_real = cpu_time_mult / (elapsedTime / 1000);
-    printf("Acceleration reelle pour l'addition : %f\n", accel_add_real);
-    printf("Acceleration reelle pour la multiplication : %f\n", accel_mult_real);
-
-
-    // Libération mémoire
-    free(h_M1);
-    free(h_M2);
-    free(h_Mout);
-    cudaFree(d_M1);
-    cudaFree(d_M2);
-    cudaFree(d_Mout);
+    // GPU
+    cudaFree(d_inputImage);
+    cudaFree(d_C1_kernels);
+    cudaFree(d_C1_bias);
+    cudaFree(d_C1_output);
+    cudaFree(d_C3_kernels);
+    cudaFree(d_C3_bias);
+    cudaFree(d_C3_output);
+    cudaFree(d_flatten);
+    cudaFree(d_FC1_weights);
+    cudaFree(d_FC1_bias);
+    cudaFree(d_FC1_output);
+    cudaFree(d_FC2_weights);
+    cudaFree(d_FC2_bias);
+    cudaFree(d_FC2_output);
+    cudaFree(d_FC3_weights);
+    cudaFree(d_FC3_bias);
+    cudaFree(d_FC3_output);
+    cudaFree(d_softmax);
 
     return 0;
 }
 
-// Fonction d'initialisation pour les matrices entre 0 et 1
-void init_matrix(float *matrix, int size) {
-    for (int i = 0; i < size; i++) {
-        matrix[i] = (float)rand() / (float)RAND_MAX; // Valeurs entre 0 et 1
-    }
+/****************************************************/
+/*           Lecture MNIST + endianness            */
+/****************************************************/
+unsigned int swapEndian(unsigned int value) {
+    return ((value >> 24) & 0xff)
+         | ((value << 8) & 0xff0000)
+         | ((value >> 8) & 0xff00)
+         | ((value << 24) & 0xff000000);
 }
 
-// Fonction d'initialisation à 0
-void init_zero(float *matrix, int size) {
-    for (int i = 0; i < size; i++) {
-        matrix[i] = 0.0f;
+float* readMNISTImage(const char* filename, int imgIndex) {
+    FILE* fptr = fopen(filename, "rb");
+    if (!fptr) {
+        printf("Impossible d'ouvrir le fichier : %s\n", filename);
+        exit(1);
     }
+
+    unsigned int magic, nbImg, nbRows, nbCols;
+    fread(&magic, sizeof(int), 1, fptr);
+    fread(&nbImg, sizeof(int), 1, fptr);
+    fread(&nbRows, sizeof(int), 1, fptr);
+    fread(&nbCols, sizeof(int), 1, fptr);
+
+    magic = swapEndian(magic);
+    nbImg = swapEndian(nbImg);
+    nbRows = swapEndian(nbRows);
+    nbCols = swapEndian(nbCols);
+
+    if (magic != 2051) {
+        printf("Erreur: fichier MNIST invalide (magic=%u)\n", magic);
+        fclose(fptr);
+        exit(1);
+    }
+    if (nbRows != 28 || nbCols != 28) {
+        printf("Erreur: dimensions attendues 28x28\n");
+        fclose(fptr);
+        exit(1);
+    }
+    if (imgIndex < 0 || imgIndex >= (int)nbImg) {
+        printf("Index d'image invalide (%d), max=%u\n", imgIndex, nbImg-1);
+        fclose(fptr);
+        exit(1);
+    }
+
+    // Sauter imgIndex images
+    fseek(fptr, imgIndex * 28 * 28, SEEK_CUR);
+
+    float* image = (float*)malloc(28 * 28 * sizeof(float));
+    for(int i=0; i<28*28; i++){
+        unsigned char val;
+        fread(&val, 1, 1, fptr);
+        // Normalisation [0..1]
+        image[i] = (float)val / 255.0f;
+    }
+
+    fclose(fptr);
+    return image;
 }
 
-// Fonction pour initialiser une matrice avec des valeurs aléatoires entre -1 et 1
-void MatrixInit(float *M, int n, int p) {
-    for (int i = 0; i < n * p; i++) {
-        M[i] = (float)(rand() % 200 - 100) / 100.0;
-    }
+/****************************************************/
+/*           Fonctions d'affichage console         */
+/****************************************************/
+void charBckgrndPrint(char *str, int rgb[3]) {
+    // Séquence ANSI pour couleur de fond
+    printf("\033[48;2;%d;%d;%dm", rgb[0], rgb[1], rgb[2]);
+    // Imprimer le "str"
+    printf("%s\033[0m", str); // reset
 }
 
-// Fonction pour afficher une matrice
-void MatrixPrint(float *M, int n, int p) {
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < p; j++) {
-            printf("%.2f ", M[i * p + j]);
+void imgColorPrint(int height, int width, int ***img) {
+    for(int i=0; i<height; i++){
+        for(int j=0; j<width; j++){
+            charBckgrndPrint("  ", img[i][j]); 
         }
         printf("\n");
     }
 }
 
-// Fonction pour additionner deux matrices sur CPU
-void MatrixAdd(float *M1, float *M2, float *Mout, int n, int p) {
-    for (int i = 0; i < n * p; i++) {
-        Mout[i] = M1[i] + M2[i];
-    }
-}
-
-// Fonction pour multiplier deux matrices sur CPU
-void MatrixMult(float *M1, float *M2, float *Mout, int n) {
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            Mout[i * n + j] = 0;
-            for (int k = 0; k < n; k++) {
-                Mout[i * n + j] += M1[i * n + k] * M2[k * n + j];
-            }
+int ***allocImgRGB(int height, int width){
+    int ***img = (int ***)malloc(height * sizeof(int**));
+    for(int i=0; i<height; i++){
+        img[i] = (int **)malloc(width*sizeof(int*));
+        for(int j=0; j<width; j++){
+            img[i][j] = (int*)malloc(3*sizeof(int));
         }
     }
+    return img;
 }
-
-// Kernel pour additionner deux matrices sur GPU
-__global__ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < n && col < p) {
-        int index = row * p + col;
-        Mout[index] = M1[index] + M2[index];
-    }
-}
-
-// Kernel pour multiplier deux matrices sur GPU
-__global__ void cudaMatrixMult(float *M1, float *M2, float *Mout, int n) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < n && col < n) {
-        float sum = 0.0;
-        for (int k = 0; k < n; k++) {
-            sum += M1[row * n + k] * M2[k * n + col];
+void freeImgRGB(int ***img, int height, int width){
+    for(int i=0; i<height; i++){
+        for(int j=0; j<width; j++){
+            free(img[i][j]);
         }
-        Mout[row * n + col] = sum;
+        free(img[i]);
     }
+    free(img);
 }
 
-// Fonction pour effectuer la convolution 2D
-void convolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels) {
-    for (int k = 0; k < num_kernels; k++) { // Pour chaque noyau
-        for (int i = 0; i < output_size; i++) {
-            for (int j = 0; j < output_size; j++) {
-                float sum = 0.0f;
-                for (int ki = 0; ki < kernel_size; ki++) {
-                    for (int kj = 0; kj < kernel_size; kj++) {
-                        int input_row = i + ki;
-                        int input_col = j + kj;
-                        sum += input[input_row * input_size + input_col] *
-                               kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
-                    }
-                }
-                output[k * output_size * output_size + i * output_size + j] = sum;
-            }
-        }
-    }
-}
-
-// Fonction pour effectuer le sous-échantillonnage 2D (moyennage)
-void subsampling2D(float *input, float *output, int input_size, int output_size, int num_channels) {
-    for (int c = 0; c < num_channels; c++) { // Pour chaque canal
-        for (int i = 0; i < output_size; i++) {
-            for (int j = 0; j < output_size; j++) {
-                int input_row = i * 2;
-                int input_col = j * 2;
-                float sum = 0.0f;
-                for (int ki = 0; ki < 2; ki++) {
-                    for (int kj = 0; kj < 2; kj++) {
-                        sum += input[c * input_size * input_size + (input_row + ki) * input_size + (input_col + kj)];
-                    }
-                }
-                output[c * output_size * output_size + i * output_size + j] = sum / 4.0f;
-            }
-        }
-    }
-}
-
-// Fonction d'activation tanh
-__device__ float activation_tanh(float M) {
-    return tanhf(M); // Fonction hyperbolique tangente optimisée
-}
-
-// Kernel pour effectuer la convolution 2D avec activation tanh
-__global__ void cudaConvolution2D(float *input, float *output, float *kernels, int input_size, int kernel_size, int output_size, int num_kernels) {
-    int k = blockIdx.z; // Identifiant du noyau (canal)
-    int i = blockIdx.y * blockDim.y + threadIdx.y; // Ligne de la matrice de sortie
-    int j = blockIdx.x * blockDim.x + threadIdx.x; // Colonne de la matrice de sortie
-
-    if (k < num_kernels && i < output_size && j < output_size) {
-        float sum = 0.0f;
-        for (int ki = 0; ki < kernel_size; ki++) {
-            for (int kj = 0; kj < kernel_size; kj++) {
-                int input_row = i + ki;
-                int input_col = j + kj;
-                sum += input[input_row * input_size + input_col] * kernels[k * kernel_size * kernel_size + ki * kernel_size + kj];
-            }
-        }
-        // Appliquer l'activation tanh sur la somme calculée
-        output[k * output_size * output_size + i * output_size + j] = activation_tanh(sum);
-    }
-}
-
-
-// Pour la fonction d'activation softmax :
-// 4. Softmax Kernel
-__global__ void softmax(float* input, float* output, int size) {
-    extern __shared__ float temp[];
-    int idx = threadIdx.x;
-    if (idx < size) {
-        temp[idx] = expf(input[idx]);
-        __syncthreads();
-        float sum = 0.0f;
-        for (int i = 0; i < size; i++) sum += temp[i];
-        output[idx] = temp[idx] / sum;
-    }
-}
-// Pour le   keras.layers.Dense(120, activation='tanh'), #C5
-// 5. Fully Connected Layer Kernel for Dense 120
-__global__ void fullyConnected120(float* input, float* weights, float* biases, float* output, int input_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < 120) {
-        float sum = biases[idx];
-        for (int i = 0; i < input_size; i++) {
-            sum += input[i] * weights[idx * input_size + i];
-        }
-        output[idx] = tanhf(sum);
-    }
-}
-
-// Pour le   keras.layers.Dense(84, activation='tanh'), #C5
-// 6. Fully Connected Layer Kernel for Dense 84
-__global__ void fullyConnected84(float* input, float* weights, float* biases, float* output, int input_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < 84) {
-        float sum = biases[idx];
-        for (int i = 0; i < input_size; i++) {
-            sum += input[i] * weights[idx * input_size + i];
-        }
-        output[idx] = tanhf(sum);
-    }
-}
-
-// Importation des poids dans les matrices CUDA
+/****************************************************/
+/*      Chargement des poids / biais .bin          */
+/****************************************************/
 void loadWeights(const char *file_path, float *host_data, int size) {
     FILE *file = fopen(file_path, "rb");
-    if (file == NULL) {
-        printf("Erreur : impossible d'ouvrir le fichier %s\n", file_path);
+    if(file == NULL){
+        printf("Erreur: impossible d'ouvrir %s\n", file_path);
         exit(1);
     }
     fread(host_data, sizeof(float), size, file);
     fclose(file);
 }
 
+/****************************************************/
+/*       Convolution multi-canal (GPU)             */
+/****************************************************/
+__device__ float activation_tanh(float x){
+    return tanhf(x);
+}
+
+__global__ void cudaConv2DMultiChannel(
+    float *input,    
+    float *output,   
+    float *kernels,  
+    float *bias,     
+    int in_channels,
+    int input_size,
+    int kernel_size,
+    int out_channels,
+    int output_size
+){
+    int oc = blockIdx.z;
+    int out_i = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_j = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(oc < out_channels && out_i < output_size && out_j < output_size){
+        float sum = bias[oc];
+        for(int ic=0; ic<in_channels; ic++){
+            for(int ki=0; ki<kernel_size; ki++){
+                for(int kj=0; kj<kernel_size; kj++){
+                    int in_i = out_i + ki;
+                    int in_j = out_j + kj;
+                    float val = input[ic*(input_size*input_size) + in_i*input_size + in_j];
+                    float w = kernels[
+                        oc*(in_channels*kernel_size*kernel_size)
+                        + ic*(kernel_size*kernel_size)
+                        + ki*kernel_size
+                        + kj
+                    ];
+                    sum += val * w;
+                }
+            }
+        }
+        // activation
+        output[oc*(output_size*output_size) + out_i*output_size + out_j] = activation_tanh(sum);
+    }
+}
+
+/****************************************************/
+/*     Pooling 2x2, CPU                             */
+/****************************************************/
+void subsampling2D(float *input, float *output, 
+                   int input_size, int output_size,
+                   int num_channels)
+{
+    for (int c = 0; c < num_channels; c++){
+        for(int i=0; i<output_size; i++){
+            for(int j=0; j<output_size; j++){
+                int in_i = i*2;
+                int in_j = j*2;
+                float sum=0.0f;
+                for(int ki=0; ki<2; ki++){
+                    for(int kj=0; kj<2; kj++){
+                        sum += input[c*input_size*input_size + (in_i+ki)*input_size + (in_j+kj)];
+                    }
+                }
+                output[c*output_size*output_size + i*output_size + j] = sum / 4.0f;
+            }
+        }
+    }
+}
+
+/****************************************************/
+/*     Flatten 16@5x5 => 400 (CPU)                  */
+/****************************************************/
+void flattenCPU(float* input, float* output, 
+                int channels, int height, int width)
+{
+    int idx=0;
+    for(int c=0; c<channels; c++){
+        for(int i=0; i<height; i++){
+            for(int j=0; j<width; j++){
+                output[idx++] = input[c*height*width + i*width + j];
+            }
+        }
+    }
+}
+
+/****************************************************/
+/*      FC layers (GPU)                             */
+/****************************************************/
+__global__ void fullyConnected120(float* input, float* weights, float* biases,
+                                  float* output, int input_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < 120){
+        float sum = biases[idx];
+        for(int i=0; i<input_size; i++){
+            sum += input[i] * weights[idx*input_size + i];
+        }
+        output[idx] = tanhf(sum);
+    }
+}
+
+__global__ void fullyConnected84(float* input, float* weights, float* biases,
+                                 float* output, int input_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < 84){
+        float sum = biases[idx];
+        for(int i=0; i<input_size; i++){
+            sum += input[i] * weights[idx*input_size + i];
+        }
+        output[idx] = tanhf(sum);
+    }
+}
+
+__global__ void fullyConnected10(float* input, float* weights, float* biases,
+                                 float* output, int input_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < 10){
+        float sum = biases[idx];
+        for(int i=0; i<input_size; i++){
+            sum += input[i] * weights[idx*input_size + i];
+        }
+        // pas de tanh, on applique softmax après
+        output[idx] = sum;
+    }
+}
+
+/****************************************************/
+/*    Softmax (GPU)                                 */
+/****************************************************/
+__global__ void softmaxKernel(float* input, float* output, int size){
+    __shared__ float tmp[32]; // 10 < 32
+    int tid = threadIdx.x;
+
+    if(tid < size){
+        tmp[tid] = expf(input[tid]);
+    }
+    __syncthreads();
+
+    float sum=0.0f;
+    if(tid==0){
+        for(int i=0; i<size; i++){
+            sum += tmp[i];
+        }
+        tmp[0] = sum;  // on stocke la somme en tmp[0]
+    }
+    __syncthreads();
+
+    if(tid < size){
+        output[tid] = tmp[tid] / tmp[0];
+    }
+}
+
+/****************************************************/
+/*     argmax CPU                                   */
+/****************************************************/
+int argmaxCPU(float* data, int size){
+    int bestIdx=0;
+    float bestVal = data[0];
+    for(int i=1; i<size; i++){
+        if(data[i] > bestVal){
+            bestVal = data[i];
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
+}
